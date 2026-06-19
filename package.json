@@ -1,0 +1,12 @@
+{
+  "name": "bike-care-inventory-sync",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Schindler B2B XML feed → Shopify inventory sync for Bike Care.cz",
+  "type": "commonjs",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "sync": "node sync.js",
+    "dry-run": "DRY_RUN=1 node sync.js"
+  }
+}

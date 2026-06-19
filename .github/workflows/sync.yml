@@ -1,0 +1,35 @@
+name: Inventory sync
+
+on:
+  schedule:
+    - cron: "0 */3 * * *" # every 3 hours (UTC) — 8× per day
+  workflow_dispatch: # manual "Run workflow" button
+    inputs:
+      dry_run:
+        description: "Dry run (log only, write nothing)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: inventory-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Run sync
+        env:
+          SHOPIFY_STORE_DOMAIN: ${{ secrets.SHOPIFY_STORE_DOMAIN }}
+          SHOPIFY_ADMIN_TOKEN: ${{ secrets.SHOPIFY_ADMIN_TOKEN }}
+          FEED_URL: ${{ secrets.FEED_URL }}
+          # Optional overrides (defaults live in sync.js):
+          # SHOPIFY_LOCATION_ID: gid://shopify/Location/120161861972
+          # SKU_PREFIX: "DY-"
+          DRY_RUN: ${{ github.event.inputs.dry_run == 'true' && '1' || '' }}
+        run: node sync.js
