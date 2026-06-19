@@ -2,7 +2,7 @@ name: Inventory sync
 
 on:
   schedule:
-    - cron: "0 */3 * * *" # every 3 hours (UTC) — 8× per day
+    - cron: "0 * * * *" # every hour (UTC) — 24× per day
   workflow_dispatch: # manual "Run workflow" button
     inputs:
       dry_run:
