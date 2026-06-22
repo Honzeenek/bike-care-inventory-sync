@@ -8,11 +8,20 @@
  * "DY-") AND that exist in the feed are touched — anything not in the feed
  * (custom bundles, discontinued items) is never modified.
  *
+ * It also enforces inventoryPolicy = DENY on every managed SKU_PREFIX variant
+ * (whether or not it's in the feed). Without this, a variant set to "continue
+ * selling when out of stock" (CONTINUE) keeps showing as in stock on the
+ * storefront even after its quantity is synced to 0 — so the 0 we write would
+ * be invisible to customers. Enforcing DENY makes 0-quantity items show as
+ * sold out. This needs the write_products scope; if the token lacks it, the
+ * run warns loudly and continues (quantity sync is unaffected).
+ *
  * Stock only. Prices/descriptions/images are left alone.
  *
  * Required env:
  *   SHOPIFY_STORE_DOMAIN   e.g. yy0cc2-y7.myshopify.com
- *   SHOPIFY_ADMIN_TOKEN    Admin API access token (scopes: read_products, read_inventory, write_inventory)
+ *   SHOPIFY_ADMIN_TOKEN    Admin API access token
+ *                          (scopes: read_products, write_products, read_inventory, write_inventory)
  *   FEED_URL               live gzip feed URL from the B2B portal (contains the ?key=...)
  * Optional env:
  *   SHOPIFY_LOCATION_ID    default gid://shopify/Location/120161861972
@@ -38,6 +47,7 @@ const {
   API_VERSION = "2025-07",
   MIN_FEED_ITEMS = "10",
   DRY_RUN = "",
+  DEBUG_SKU = "", // comma-separated CODE(s) → print raw feed block(s) and exit-safe
 } = process.env;
 
 const dryRun = DRY_RUN === "1" || DRY_RUN === "true";
@@ -80,22 +90,26 @@ async function loadFeed() {
 // ---------------------------------------------------------------------------
 function parseFeed(xml) {
   const items = xml.split("<SHOPITEM>").slice(1);
-  const map = {};
+  const stock = {};
+  const raw = {};
   for (const it of items) {
     const codeM = it.match(/<CODE>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/CODE>/);
     if (!codeM) continue;
     const code = codeM[1].trim();
     if (!code.startsWith(SKU_PREFIX)) continue;
     const stockM = it.match(/<STOCK_ITEM>\s*(\d+)\s*<\/STOCK_ITEM>/);
-    map[code] = stockM ? parseInt(stockM[1], 10) : 0; // missing STOCK_ITEM ⇒ out of stock
+    stock[code] = stockM ? parseInt(stockM[1], 10) : 0; // missing STOCK_ITEM ⇒ out of stock
+    raw[code] = "<SHOPITEM>" + it.split("</SHOPITEM>")[0] + "</SHOPITEM>"; // for DEBUG_SKU
   }
-  return map;
+  return { stock, raw };
 }
 
 // ---------------------------------------------------------------------------
 // 3. Shopify Admin GraphQL helper.
 // ---------------------------------------------------------------------------
-async function shopify(query, variables) {
+// Low-level call: returns the raw { ok, status, json } so callers can decide
+// whether an error is fatal.
+async function gql(query, variables) {
   const res = await fetch(
     `https://${SHOPIFY_STORE_DOMAIN}/admin/api/${API_VERSION}/graphql.json`,
     {
@@ -107,22 +121,28 @@ async function shopify(query, variables) {
       body: JSON.stringify({ query, variables }),
     },
   );
-  const json = await res.json();
-  if (!res.ok || json.errors) {
-    fail("Shopify API error: " + JSON.stringify(json.errors || res.status));
+  return { ok: res.ok, status: res.status, json: await res.json() };
+}
+
+// Strict call: any transport or GraphQL error aborts the run.
+async function shopify(query, variables) {
+  const { ok, status, json } = await gql(query, variables);
+  if (!ok || json.errors) {
+    fail("Shopify API error: " + JSON.stringify(json.errors || status));
   }
   return json.data;
 }
 
-// Fetch every variant with the SKU prefix → { sku: inventoryItemId }.
-async function fetchVariantMap() {
-  const map = {};
+// Fetch every variant with the SKU prefix as a record:
+// { sku, inventoryItemId, variantId, productId, inventoryPolicy }.
+async function fetchVariants() {
+  const out = [];
   let cursor = null;
   do {
     const data = await shopify(
       `query($cursor: String) {
         productVariants(first: 250, after: $cursor) {
-          edges { node { sku inventoryItem { id } } }
+          edges { node { id sku inventoryPolicy inventoryItem { id } product { id } } }
           pageInfo { hasNextPage endCursor }
         }
       }`,
@@ -131,12 +151,66 @@ async function fetchVariantMap() {
     const conn = data.productVariants;
     for (const { node } of conn.edges) {
       if (node.sku && node.sku.startsWith(SKU_PREFIX) && node.inventoryItem) {
-        map[node.sku] = node.inventoryItem.id;
+        out.push({
+          sku: node.sku,
+          inventoryItemId: node.inventoryItem.id,
+          variantId: node.id,
+          productId: node.product.id,
+          inventoryPolicy: node.inventoryPolicy,
+        });
       }
     }
     cursor = conn.pageInfo.hasNextPage ? conn.pageInfo.endCursor : null;
   } while (cursor);
-  return map;
+  return out;
+}
+
+const SET_POLICY = `
+  mutation SetPolicy($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+    productVariantsBulkUpdate(productId: $productId, variants: $variants) {
+      userErrors { field message }
+    }
+  }`;
+
+// Ensure every managed variant is DENY so out-of-stock items hide from the
+// storefront. Idempotent: variants already DENY are left alone, so once the
+// catalogue is corrected this is a no-op. Needs the write_products scope; if
+// the token lacks it we warn and continue rather than failing the quantity sync.
+async function enforceDenyPolicy(records) {
+  const offenders = records.filter((r) => r.inventoryPolicy !== "DENY");
+  if (!offenders.length) {
+    log("Policy: all managed variants already DENY.");
+    return;
+  }
+  log(`Policy: ${offenders.length} variant(s) on CONTINUE → setting DENY: ${offenders.map((r) => r.sku).join(", ")}`);
+  if (dryRun) {
+    log("DRY_RUN — would set inventoryPolicy=DENY on the above.");
+    return;
+  }
+
+  // productVariantsBulkUpdate is per-product, so group the offenders by product.
+  const byProduct = new Map();
+  for (const r of offenders) {
+    if (!byProduct.has(r.productId)) byProduct.set(r.productId, []);
+    byProduct.get(r.productId).push({ id: r.variantId, inventoryPolicy: "DENY" });
+  }
+
+  for (const [productId, variants] of byProduct) {
+    const { ok, status, json } = await gql(SET_POLICY, { productId, variants });
+    if (!ok || json.errors) {
+      const msg = JSON.stringify(json.errors || status);
+      if (/access denied|write_products|ACCESS_DENIED/i.test(msg)) {
+        log("⚠ Could not set inventoryPolicy=DENY — the Admin token is missing the 'write_products' scope.");
+        log("⚠ Out-of-stock items still on CONTINUE will keep showing as in stock.");
+        log("⚠ Fix: add write_products to the 'Stock Sync' app's scopes, re-run get-token.js to mint a new token, and update the SHOPIFY_ADMIN_TOKEN secret.");
+        return; // one warning is enough; don't spam per product
+      }
+      fail("inventoryPolicy update error: " + msg);
+    }
+    const errs = json.data.productVariantsBulkUpdate.userErrors;
+    if (errs && errs.length) fail("productVariantsBulkUpdate: " + JSON.stringify(errs));
+  }
+  log(`✓ Set inventoryPolicy=DENY on ${offenders.length} variant(s).`);
 }
 
 const SET_QUANTITIES = `
@@ -172,40 +246,52 @@ async function setQuantities(quantities) {
   }
 
   const xml = await loadFeed();
-  const feed = parseFeed(xml);
+  const { stock: feed, raw: feedRaw } = parseFeed(xml);
   const feedCount = Object.keys(feed).length;
   log(`Feed: ${feedCount} '${SKU_PREFIX}*' items.`);
+
+  // Debug: dump the raw feed block(s) for the given CODE(s) so we can inspect
+  // how Schindler represents availability. Prints and exits without writing.
+  if (DEBUG_SKU) {
+    for (const code of DEBUG_SKU.split(",").map((s) => s.trim()).filter(Boolean)) {
+      log(`\n── DEBUG ${code} ── stock=${code in feed ? feed[code] : "(not in feed)"}`);
+      log(feedRaw[code] || "(no SHOPITEM block for this CODE)");
+    }
+    log("\nDEBUG_SKU set — no writes performed.");
+    return;
+  }
 
   // Safety floor: a broken/empty feed must never zero out the catalogue.
   if (feedCount < parseInt(MIN_FEED_ITEMS, 10)) {
     fail(`Only ${feedCount} feed items (< MIN_FEED_ITEMS=${MIN_FEED_ITEMS}); aborting without writes.`);
   }
 
-  const variants = await fetchVariantMap();
-  log(`Store: ${Object.keys(variants).length} '${SKU_PREFIX}*' variants.`);
+  const records = await fetchVariants();
+  log(`Store: ${records.length} '${SKU_PREFIX}*' variants.`);
 
   const quantities = [];
   const updated = [];
-  for (const [sku, inventoryItemId] of Object.entries(variants)) {
-    if (Object.prototype.hasOwnProperty.call(feed, sku)) {
-      quantities.push({ inventoryItemId, locationId: SHOPIFY_LOCATION_ID, quantity: feed[sku] });
-      updated.push(`${sku}=${feed[sku]}`);
+  for (const r of records) {
+    if (Object.prototype.hasOwnProperty.call(feed, r.sku)) {
+      quantities.push({ inventoryItemId: r.inventoryItemId, locationId: SHOPIFY_LOCATION_ID, quantity: feed[r.sku] });
+      updated.push(`${r.sku}=${feed[r.sku]}`);
     }
   }
 
-  const skipped = Object.keys(variants).filter((s) => !(s in feed));
+  const skipped = records.map((r) => r.sku).filter((s) => !(s in feed));
   log(`Matched ${quantities.length} variants. Skipped (in store, not in feed): ${skipped.length}${skipped.length ? " → " + skipped.join(", ") : ""}`);
 
+  // 1) Sync quantities for feed-matched variants.
   if (!quantities.length) {
-    log("Nothing to update.");
-    return;
-  }
-
-  if (dryRun) {
+    log("Nothing to update (quantities).");
+  } else if (dryRun) {
     log("DRY_RUN — would set: " + updated.join(", "));
-    return;
+  } else {
+    await setQuantities(quantities);
+    log(`✓ Updated ${quantities.length} variants at ${new Date().toISOString()}.`);
   }
 
-  await setQuantities(quantities);
-  log(`✓ Updated ${quantities.length} variants at ${new Date().toISOString()}.`);
+  // 2) Enforce DENY on every managed variant (feed-matched or not) so 0-stock
+  //    items actually show as sold out instead of "continue selling".
+  await enforceDenyPolicy(records);
 })().catch((e) => fail(e && e.stack ? e.stack : String(e)));

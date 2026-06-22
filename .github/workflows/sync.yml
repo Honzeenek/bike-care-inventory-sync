@@ -9,6 +9,10 @@ on:
         description: "Dry run (log only, write nothing)"
         type: boolean
         default: false
+      debug_sku:
+        description: "Print raw feed block(s) for CODE(s), comma-separated (no writes)"
+        type: string
+        default: ""
 
 concurrency:
   group: inventory-sync
@@ -32,4 +36,5 @@ jobs:
           # SHOPIFY_LOCATION_ID: gid://shopify/Location/120161861972
           # SKU_PREFIX: "DY-"
           DRY_RUN: ${{ github.event.inputs.dry_run == 'true' && '1' || '' }}
+          DEBUG_SKU: ${{ github.event.inputs.debug_sku }}
         run: node sync.js
