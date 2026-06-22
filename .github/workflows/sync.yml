@@ -2,7 +2,11 @@ name: Inventory sync
 
 on:
   schedule:
-    - cron: "0 * * * *" # every hour (UTC) — 24× per day
+    # ~every 20 min at off-peak minutes. GitHub heavily throttles/drops
+    # scheduled jobs (worst at the top of the hour, ":00"), so we avoid :00
+    # and run 3×/hour — this shrinks how long stale stock can linger when
+    # GitHub delays a run. Cadence is still best-effort, not guaranteed.
+    - cron: "7,27,47 * * * *"
   workflow_dispatch: # manual "Run workflow" button
     inputs:
       dry_run:

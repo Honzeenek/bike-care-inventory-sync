@@ -11,6 +11,11 @@ several times a day. No app fees, no manual edits.
 2. Reads `STOCK_ITEM` per product `CODE`.
 3. Matches feed `CODE` → Shopify variant **SKU** (they're identical, e.g. `DY-029`).
 4. Sets the **available** quantity at the store location via `inventorySetQuantities`.
+5. Forces `inventoryPolicy = DENY` on every managed variant, so items synced to
+   0 actually show as **sold out** instead of "continue selling when out of
+   stock" (which would keep them buyable at 0). Idempotent — a no-op once the
+   catalogue is correct. Needs the `write_products` scope; without it the run
+   logs a warning and continues (quantities still sync).
 
 **Scope & safety**
 
@@ -27,6 +32,7 @@ Shopify admin → **Settings → Apps and sales channels → Develop apps → Cr
 ("Inventory Sync"). Under **Configuration → Admin API integration**, grant:
 
 - `read_products`
+- `write_products` (to enforce `inventoryPolicy = DENY`)
 - `read_inventory`
 - `write_inventory`
 
@@ -49,9 +55,12 @@ Push this folder to a **private** GitHub repo, then in
 | `SHOPIFY_ADMIN_TOKEN` | the `shpat_…` token from step 1 |
 | `FEED_URL` | the feed URL from step 2 |
 
-Actions are scheduled in `.github/workflows/sync.yml` (every 3 hours). Open the
+Actions are scheduled in `.github/workflows/sync.yml` (~every 20 min, off-peak
+minutes). Note GitHub throttles/drops scheduled jobs, so cadence is best-effort,
+not guaranteed — runs can be delayed by an hour or more under load. Open the
 **Actions** tab → **Inventory sync** → **Run workflow** to trigger it manually;
-tick **Dry run** the first time to preview without writing.
+tick **Dry run** the first time to preview without writing, or set **debug_sku**
+(e.g. `DY-156`) to print Schindler's raw feed block for a CODE without writing.
 
 ## Run locally (testing)
 
@@ -82,4 +91,5 @@ SHOPIFY_STORE_DOMAIN=... SHOPIFY_ADMIN_TOKEN=... node sync.js
 | `API_VERSION` | `2025-07` | Admin API version |
 | `MIN_FEED_ITEMS` | `10` | safety floor |
 | `DRY_RUN` | — | `1` = log only |
+| `DEBUG_SKU` | — | comma-separated CODE(s); print raw feed block(s), no writes |
 | `FEED_FILE` | — | read local XML instead of `FEED_URL` |
