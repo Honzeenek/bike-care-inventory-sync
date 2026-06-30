@@ -55,12 +55,31 @@ Push this folder to a **private** GitHub repo, then in
 | `SHOPIFY_ADMIN_TOKEN` | the `shpat_…` token from step 1 |
 | `FEED_URL` | the feed URL from step 2 |
 
-Actions are scheduled in `.github/workflows/sync.yml` (~every 20 min, off-peak
-minutes). Note GitHub throttles/drops scheduled jobs, so cadence is best-effort,
-not guaranteed — runs can be delayed by an hour or more under load. Open the
+Actions are scheduled in `.github/workflows/sync.yml` (hourly at `:17`). Open the
 **Actions** tab → **Inventory sync** → **Run workflow** to trigger it manually;
-tick **Dry run** the first time to preview without writing, or set **debug_sku**
-(e.g. `DY-156`) to print Schindler's raw feed block for a CODE without writing.
+tick **Dry run** the first time to preview without writing, **audit** for a
+read-only feed-vs-store health report, or set **debug_sku** (e.g. `DY-156`) to
+print Schindler's raw feed block for a CODE without writing.
+
+### 4. Reliable scheduling (external pinger) — recommended
+
+GitHub **throttles and drops `schedule:` jobs** — they can be delayed hours or
+skipped, which is what makes stock look stale. The fix is to trigger the workflow
+from an outside clock; GitHub runs *dispatched* jobs immediately, no throttling.
+The `schedule:` above stays as a best-effort fallback.
+
+1. **Fine-grained GitHub token** — github.com → Settings → Developer settings →
+   Personal access tokens → Fine-grained tokens → **Generate new token**.
+   Repository access: *Only select repositories* → `bike-care-inventory-sync`.
+   Permissions → **Actions: Read and write** (Metadata read is added
+   automatically). Copy the `github_pat_…` token.
+2. **cron-job.org** (free) → **Create cronjob**, **Every 1 hour**, Advanced:
+   - URL: `https://api.github.com/repos/Honzeenek/bike-care-inventory-sync/actions/workflows/sync.yml/dispatches`
+   - Method: `POST` · Body: `{"ref":"main"}`
+   - Headers: `Authorization: Bearer github_pat_…` · `Accept: application/vnd.github+json` · `X-GitHub-Api-Version: 2022-11-28`
+
+GitHub returns `204` on success. The token only triggers runs on this one repo —
+it can't read code or secrets. ~1 Actions minute per run (~720/month hourly).
 
 ## Run locally (testing)
 
@@ -91,5 +110,6 @@ SHOPIFY_STORE_DOMAIN=... SHOPIFY_ADMIN_TOKEN=... node sync.js
 | `API_VERSION` | `2025-07` | Admin API version |
 | `MIN_FEED_ITEMS` | `10` | safety floor |
 | `DRY_RUN` | — | `1` = log only |
+| `AUDIT` | — | `1` = read-only report: feed vs live store qty + tracking, no writes |
 | `DEBUG_SKU` | — | comma-separated CODE(s); print raw feed block(s), no writes |
 | `FEED_FILE` | — | read local XML instead of `FEED_URL` |

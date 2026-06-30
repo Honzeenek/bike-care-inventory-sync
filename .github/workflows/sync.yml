@@ -2,11 +2,13 @@ name: Inventory sync
 
 on:
   schedule:
-    # ~every 20 min at off-peak minutes. GitHub heavily throttles/drops
-    # scheduled jobs (worst at the top of the hour, ":00"), so we avoid :00
-    # and run 3×/hour — this shrinks how long stale stock can linger when
-    # GitHub delays a run. Cadence is still best-effort, not guaranteed.
-    - cron: "7,27,47 * * * *"
+    # Hourly at :17 (NOT :00 — GitHub delays/drops scheduled jobs most at the
+    # top of the hour). This GitHub schedule is only a BEST-EFFORT FALLBACK and
+    # can still be delayed hours or skipped. The RELIABLE hourly trigger is an
+    # external pinger (cron-job.org) that POSTs to this workflow's
+    # workflow_dispatch endpoint every hour — GitHub runs dispatched jobs
+    # immediately, with no throttling. See README "Reliable scheduling".
+    - cron: "17 * * * *"
   workflow_dispatch: # manual "Run workflow" button
     inputs:
       dry_run:
