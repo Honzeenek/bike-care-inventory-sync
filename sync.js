@@ -48,9 +48,11 @@ const {
   MIN_FEED_ITEMS = "10",
   DRY_RUN = "",
   DEBUG_SKU = "", // comma-separated CODE(s) → print raw feed block(s) and exit-safe
+  AUDIT = "", // "1" = read-only health report (feed vs live store qty + tracking), no writes
 } = process.env;
 
 const dryRun = DRY_RUN === "1" || DRY_RUN === "true";
+const auditMode = AUDIT === "1" || AUDIT === "true";
 
 function fail(msg) {
   console.error("✖ " + msg);
@@ -165,6 +167,82 @@ async function fetchVariants() {
   return out;
 }
 
+// Read-only health audit: for every managed variant, fetch tracking flag and
+// the CURRENT "available" quantity at the location, then diff against the feed.
+// Surfaces exactly why a product can misbehave on the storefront:
+//   • tracked=false  → storefront ignores quantity AND policy → always buyable
+//   • not in feed    → quantity is frozen (never synced); may be stale
+//   • store ≠ feed   → last write didn't stick, or feed changed since last sync
+//   • feed=0         → should read sold-out (only works if tracked && DENY)
+// Writes nothing.
+async function auditVariants() {
+  const out = [];
+  let cursor = null;
+  do {
+    const data = await shopify(
+      `query($cursor: String, $loc: ID!) {
+        productVariants(first: 250, after: $cursor) {
+          edges { node {
+            sku inventoryPolicy
+            inventoryItem {
+              tracked
+              inventoryLevel(locationId: $loc) {
+                quantities(names: ["available"]) { quantity }
+              }
+            }
+          } }
+          pageInfo { hasNextPage endCursor }
+        }
+      }`,
+      { cursor, loc: SHOPIFY_LOCATION_ID },
+    );
+    const conn = data.productVariants;
+    for (const { node } of conn.edges) {
+      if (!node.sku || !node.sku.startsWith(SKU_PREFIX) || !node.inventoryItem) continue;
+      const lvl = node.inventoryItem.inventoryLevel;
+      out.push({
+        sku: node.sku,
+        policy: node.inventoryPolicy,
+        tracked: node.inventoryItem.tracked,
+        available: lvl && lvl.quantities && lvl.quantities[0] ? lvl.quantities[0].quantity : null,
+      });
+    }
+    cursor = conn.pageInfo.hasNextPage ? conn.pageInfo.endCursor : null;
+  } while (cursor);
+  return out;
+}
+
+function runAudit(records, feed) {
+  records.sort((a, b) => a.sku.localeCompare(b.sku, undefined, { numeric: true }));
+  const untracked = [];
+  const notInFeed = [];
+  const mismatch = []; // in feed but store qty != feed qty
+  const soldOut = []; // feed=0
+  for (const r of records) {
+    const inFeed = Object.prototype.hasOwnProperty.call(feed, r.sku);
+    const fq = inFeed ? feed[r.sku] : null;
+    if (r.tracked === false) untracked.push(r.sku);
+    if (!inFeed) { notInFeed.push(`${r.sku}(store=${r.available})`); continue; }
+    if (fq === 0) soldOut.push(`${r.sku}(store=${r.available}${r.tracked === false ? ",UNTRACKED!" : ""}${r.policy !== "DENY" ? ",CONTINUE!" : ""})`);
+    if (r.available !== fq) mismatch.push(`${r.sku}: store=${r.available} feed=${fq}`);
+  }
+  log("\n================ AUDIT REPORT ================");
+  log(`Variants checked: ${records.length}\n`);
+
+  log(`⚠ UNTRACKED (inventory tracking OFF → always buyable, sync can't help): ${untracked.length}`);
+  if (untracked.length) log("   " + untracked.join(", "));
+
+  log(`\n⚠ NOT IN FEED (stock frozen, never synced): ${notInFeed.length}`);
+  if (notInFeed.length) log("   " + notInFeed.join(", "));
+
+  log(`\n⚠ STORE ≠ FEED (write didn't stick or feed moved since last sync): ${mismatch.length}`);
+  if (mismatch.length) log("   " + mismatch.join("\n   "));
+
+  log(`\n• FEED=0 (should show sold-out; flagged if untracked/CONTINUE): ${soldOut.length}`);
+  if (soldOut.length) log("   " + soldOut.join(", "));
+  log("=============================================\n");
+}
+
 const SET_POLICY = `
   mutation SetPolicy($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
     productVariantsBulkUpdate(productId: $productId, variants: $variants) {
@@ -258,6 +336,14 @@ async function setQuantities(quantities) {
       log(feedRaw[code] || "(no SHOPITEM block for this CODE)");
     }
     log("\nDEBUG_SKU set — no writes performed.");
+    return;
+  }
+
+  // Read-only audit: report feed vs live store state and exit without writing.
+  if (auditMode) {
+    const audited = await auditVariants();
+    log(`Store: ${audited.length} '${SKU_PREFIX}*' variants.`);
+    runAudit(audited, feed);
     return;
   }
 

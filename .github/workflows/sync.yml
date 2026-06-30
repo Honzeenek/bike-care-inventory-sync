@@ -17,6 +17,10 @@ on:
         description: "Print raw feed block(s) for CODE(s), comma-separated (no writes)"
         type: string
         default: ""
+      audit:
+        description: "Read-only health report: feed vs live store qty + tracking (no writes)"
+        type: boolean
+        default: false
 
 concurrency:
   group: inventory-sync
@@ -41,4 +45,5 @@ jobs:
           # SKU_PREFIX: "DY-"
           DRY_RUN: ${{ github.event.inputs.dry_run == 'true' && '1' || '' }}
           DEBUG_SKU: ${{ github.event.inputs.debug_sku }}
+          AUDIT: ${{ github.event.inputs.audit == 'true' && '1' || '' }}
         run: node sync.js
