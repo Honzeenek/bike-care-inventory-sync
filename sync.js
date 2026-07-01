@@ -48,6 +48,7 @@ const {
   MIN_FEED_ITEMS = "10",
   DRY_RUN = "",
   DEBUG_SKU = "", // comma-separated CODE(s) → print raw feed block(s) and exit-safe
+  DEBUG_FIND = "", // substring → search ALL feed items (any CODE) by CODE/PRODUCTNAME, no writes
   AUDIT = "", // "1" = read-only health report (feed vs live store qty + tracking), no writes
 } = process.env;
 
@@ -104,6 +105,28 @@ function parseFeed(xml) {
     raw[code] = "<SHOPITEM>" + it.split("</SHOPITEM>")[0] + "</SHOPITEM>"; // for DEBUG_SKU
   }
   return { stock, raw };
+}
+
+// Search EVERY feed item (regardless of SKU_PREFIX) by CODE or PRODUCTNAME
+// substring. Answers "does Schindler carry X, and under what CODE?" — e.g. when
+// a store SKU is missing from the feed and we need to know if it was
+// discontinued or just re-coded. Prints matches; writes nothing.
+function debugFind(xml, term) {
+  const needle = term.toLowerCase();
+  const items = xml.split("<SHOPITEM>").slice(1);
+  const hits = [];
+  for (const it of items) {
+    const codeM = it.match(/<CODE>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/CODE>/);
+    const nameM = it.match(/<PRODUCTNAME>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/PRODUCTNAME>/);
+    const stockM = it.match(/<STOCK_ITEM>\s*(\d+)\s*<\/STOCK_ITEM>/);
+    const code = codeM ? codeM[1].trim() : "";
+    const name = nameM ? nameM[1].trim() : "";
+    if (code.toLowerCase().includes(needle) || name.toLowerCase().includes(needle)) {
+      hits.push(`  CODE=${code}  stock=${stockM ? stockM[1] : "(none)"}  ${name}`);
+    }
+  }
+  log(`\n── DEBUG_FIND "${term}" → ${hits.length} match(es) in the full feed ──`);
+  log(hits.length ? hits.join("\n") : "  (nothing in the feed matches that term)");
 }
 
 // ---------------------------------------------------------------------------
@@ -324,6 +347,14 @@ async function setQuantities(quantities) {
   }
 
   const xml = await loadFeed();
+
+  // Full-feed name/code search (any vendor, ignores SKU_PREFIX). No writes.
+  if (DEBUG_FIND) {
+    debugFind(xml, DEBUG_FIND);
+    log("\nDEBUG_FIND set — no writes performed.");
+    return;
+  }
+
   const { stock: feed, raw: feedRaw } = parseFeed(xml);
   const feedCount = Object.keys(feed).length;
   log(`Feed: ${feedCount} '${SKU_PREFIX}*' items.`);
