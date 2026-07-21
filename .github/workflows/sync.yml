@@ -44,6 +44,7 @@ on:
         default: false
 
 permissions:
+  contents: read # checkout (an explicit permissions block zeroes all defaults)
   actions: write # lets the job dispatch its successor with GITHUB_TOKEN
 
 concurrency:
