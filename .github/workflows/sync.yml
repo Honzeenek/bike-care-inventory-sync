@@ -1,16 +1,31 @@
 name: Inventory sync
 
+# Near-real-time sync, free on GitHub Actions (public repo = unlimited minutes):
+#
+#   • Each "loop" run syncs every ~30 s for ~55 min, then dispatches its own
+#     successor via workflow_dispatch. GITHUB_TOKEN-created workflow_dispatch
+#     events DO trigger workflows (explicit exception to the no-recursion rule),
+#     so no PAT is needed.
+#   • The hourly `schedule:` cron is only a fallback that restarts the chain if
+#     it ever breaks (GitHub throttles cron by hours — never rely on it alone).
+#   • The concurrency group keeps at most 1 running + 1 pending run, so a cron
+#     firing mid-loop is absorbed instead of forking a second chain.
+#   • KILL SWITCH: disable the workflow in the Actions UI (⋯ → Disable
+#     workflow) — dispatches to a disabled workflow are rejected, ending the
+#     chain. Re-enable + "Run workflow" (chained=true) to restart it.
+#
+# A manual "Run workflow" WITHOUT chained does a single pass (honoring the
+# dry-run/debug/audit inputs) — it does not start a second chain.
+
 on:
   schedule:
-    # Hourly at :17 (NOT :00 — GitHub delays/drops scheduled jobs most at the
-    # top of the hour). This GitHub schedule is only a BEST-EFFORT FALLBACK and
-    # can still be delayed hours or skipped. The RELIABLE hourly trigger is an
-    # external pinger (cron-job.org) that POSTs to this workflow's
-    # workflow_dispatch endpoint every hour — GitHub runs dispatched jobs
-    # immediately, with no throttling. See README "Reliable scheduling".
-    - cron: "17 * * * *"
-  workflow_dispatch: # manual "Run workflow" button
+    - cron: "17 * * * *" # fallback chain-restarter; delayed/dropped often — that's OK now
+  workflow_dispatch:
     inputs:
+      chained:
+        description: "Loop for ~55 min and dispatch the next run (the perpetual chain)"
+        type: boolean
+        default: false
       dry_run:
         description: "Dry run (log only, write nothing)"
         type: boolean
@@ -28,6 +43,9 @@ on:
         type: boolean
         default: false
 
+permissions:
+  actions: write # lets the job dispatch its successor with GITHUB_TOKEN
+
 concurrency:
   group: inventory-sync
   cancel-in-progress: false
@@ -35,12 +53,9 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 70
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
       - name: Run sync
         env:
           SHOPIFY_STORE_DOMAIN: ${{ secrets.SHOPIFY_STORE_DOMAIN }}
@@ -53,4 +68,33 @@ jobs:
           DEBUG_SKU: ${{ github.event.inputs.debug_sku }}
           DEBUG_FIND: ${{ github.event.inputs.debug_find }}
           AUDIT: ${{ github.event.inputs.audit == 'true' && '1' || '' }}
-        run: node sync.js
+          LOOP: ${{ (github.event_name == 'schedule' || github.event.inputs.chained == 'true') && '1' || '' }}
+        run: |
+          if [ -z "$LOOP" ]; then
+            node sync.js
+            exit $?
+          fi
+          export FEED_STATE_FILE="$RUNNER_TEMP/feed-state.json"
+          deadline=$(( SECONDS + 3300 ))   # ~55 min, then hand over to the next run
+          i=0; fails=0
+          while [ $SECONDS -lt $deadline ]; do
+            i=$(( i + 1 ))
+            force=""; [ $i -eq 1 ] && force=1   # full pass once per job to self-heal drift
+            echo "--- iteration $i ($(date -u +%H:%M:%S)) ---"
+            if FORCE=$force node sync.js; then
+              fails=0
+            else
+              fails=$(( fails + 1 ))
+              echo "iteration failed ($fails consecutive)"
+              if [ $fails -ge 10 ]; then
+                echo "10 consecutive failures — aborting loop (chain step still hands over)"
+                exit 1
+              fi
+            fi
+            sleep 25
+          done
+      - name: Dispatch next run in the chain
+        if: ${{ always() && (github.event_name == 'schedule' || github.event.inputs.chained == 'true') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run sync.yml -f chained=true -R "$GITHUB_REPOSITORY"

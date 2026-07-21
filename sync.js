@@ -30,11 +30,18 @@
  *   MIN_FEED_ITEMS         safety floor; abort if fewer matching items parsed (default 10)
  *   DRY_RUN                "1" = log what would change, write nothing
  *   FEED_FILE              read a local XML file instead of FEED_URL (for testing)
+ *   FEED_STATE_FILE        path to a JSON state file persisted between runs of a
+ *                          loop job. Enables (a) conditional GET on the feed
+ *                          (ETag/Last-Modified → HTTP 304 = skip run) and
+ *                          (b) skipping all Shopify calls when the parsed stock
+ *                          map is identical to the previous run's.
+ *   FORCE                  "1" = do a full pass even if the feed is unchanged
  */
 
 "use strict";
 
 const fs = require("fs");
+const crypto = require("crypto");
 const zlib = require("zlib");
 
 const {
@@ -50,10 +57,31 @@ const {
   DEBUG_SKU = "", // comma-separated CODE(s) → print raw feed block(s) and exit-safe
   DEBUG_FIND = "", // substring → search ALL feed items (any CODE) by CODE/PRODUCTNAME, no writes
   AUDIT = "", // "1" = read-only health report (feed vs live store qty + tracking), no writes
+  FEED_STATE_FILE = "",
+  FORCE = "",
 } = process.env;
 
 const dryRun = DRY_RUN === "1" || DRY_RUN === "true";
 const auditMode = AUDIT === "1" || AUDIT === "true";
+const force = FORCE === "1" || FORCE === "true";
+// Conditional GET + unchanged-skip only apply to plain sync runs in a loop job.
+const useState = Boolean(FEED_STATE_FILE) && !DEBUG_SKU && !DEBUG_FIND && !auditMode && !dryRun;
+
+function readState() {
+  try {
+    return JSON.parse(fs.readFileSync(FEED_STATE_FILE, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function writeState(state) {
+  try {
+    fs.writeFileSync(FEED_STATE_FILE, JSON.stringify(state));
+  } catch (e) {
+    log("⚠ Could not write FEED_STATE_FILE: " + e.message);
+  }
+}
 
 function fail(msg) {
   console.error("✖ " + msg);
@@ -67,25 +95,32 @@ function log(msg) {
 // ---------------------------------------------------------------------------
 // 1. Load the feed (local file or remote gzip URL) and decompress if needed.
 // ---------------------------------------------------------------------------
-async function loadFeed() {
+// Returns { xml } on fresh content, or { notModified: true } when the server
+// answered 304 to a conditional GET (loop runs only).
+async function loadFeed(state) {
   let buf;
   if (FEED_FILE) {
     log(`Reading feed from file: ${FEED_FILE}`);
     buf = fs.readFileSync(FEED_FILE);
   } else {
     if (!FEED_URL) fail("FEED_URL (or FEED_FILE) is required.");
-    log("Downloading feed…");
-    const res = await fetch(FEED_URL, {
-      headers: { "User-Agent": "BikeCare-InventorySync/1.0" },
-    });
+    const headers = { "User-Agent": "BikeCare-InventorySync/1.0" };
+    if (useState && !force) {
+      if (state.etag) headers["If-None-Match"] = state.etag;
+      if (state.lastModified) headers["If-Modified-Since"] = state.lastModified;
+    }
+    const res = await fetch(FEED_URL, { headers });
+    if (res.status === 304) return { notModified: true };
     if (!res.ok) fail(`Feed download failed: HTTP ${res.status}`);
+    state.etag = res.headers.get("etag") || "";
+    state.lastModified = res.headers.get("last-modified") || "";
     buf = Buffer.from(await res.arrayBuffer());
   }
   // gzip magic bytes 0x1f 0x8b → decompress; otherwise assume plain XML.
   if (buf.length > 2 && buf[0] === 0x1f && buf[1] === 0x8b) {
     buf = zlib.gunzipSync(buf);
   }
-  return buf.toString("utf8");
+  return { xml: buf.toString("utf8") };
 }
 
 // ---------------------------------------------------------------------------
@@ -102,7 +137,9 @@ function parseFeed(xml) {
     if (!code.startsWith(SKU_PREFIX)) continue;
     const stockM = it.match(/<STOCK_ITEM>\s*(\d+)\s*<\/STOCK_ITEM>/);
     stock[code] = stockM ? parseInt(stockM[1], 10) : 0; // missing STOCK_ITEM ⇒ out of stock
-    raw[code] = "<SHOPITEM>" + it.split("</SHOPITEM>")[0] + "</SHOPITEM>"; // for DEBUG_SKU
+    // For DEBUG_SKU. Wholesale prices are redacted — Actions logs are public.
+    raw[code] = ("<SHOPITEM>" + it.split("</SHOPITEM>")[0] + "</SHOPITEM>")
+      .replace(/<PURCHASE_PRICE>[\s\S]*?<\/PURCHASE_PRICE>/g, "<PURCHASE_PRICE>[redacted]</PURCHASE_PRICE>");
   }
   return { stock, raw };
 }
@@ -159,29 +196,45 @@ async function shopify(query, variables) {
 }
 
 // Fetch every variant with the SKU prefix as a record:
-// { sku, inventoryItemId, variantId, productId, inventoryPolicy }.
+// { sku, inventoryItemId, variantId, productId, inventoryPolicy, available, committed }.
+// available/committed are the CURRENT quantities at the store location — needed
+// to (a) subtract locally-committed units from the feed quantity and (b) write
+// only actual diffs.
 async function fetchVariants() {
   const out = [];
   let cursor = null;
   do {
     const data = await shopify(
-      `query($cursor: String) {
+      `query($cursor: String, $loc: ID!) {
         productVariants(first: 250, after: $cursor) {
-          edges { node { id sku inventoryPolicy inventoryItem { id } product { id } } }
+          edges { node {
+            id sku inventoryPolicy product { id }
+            inventoryItem {
+              id
+              inventoryLevel(locationId: $loc) {
+                quantities(names: ["available", "committed"]) { name quantity }
+              }
+            }
+          } }
           pageInfo { hasNextPage endCursor }
         }
       }`,
-      { cursor },
+      { cursor, loc: SHOPIFY_LOCATION_ID },
     );
     const conn = data.productVariants;
     for (const { node } of conn.edges) {
       if (node.sku && node.sku.startsWith(SKU_PREFIX) && node.inventoryItem) {
+        const qs = {};
+        const lvl = node.inventoryItem.inventoryLevel;
+        for (const q of (lvl && lvl.quantities) || []) qs[q.name] = q.quantity;
         out.push({
           sku: node.sku,
           inventoryItemId: node.inventoryItem.id,
           variantId: node.id,
           productId: node.product.id,
           inventoryPolicy: node.inventoryPolicy,
+          available: qs.available ?? null,
+          committed: qs.committed ?? 0,
         });
       }
     }
@@ -210,7 +263,7 @@ async function auditVariants() {
             inventoryItem {
               tracked
               inventoryLevel(locationId: $loc) {
-                quantities(names: ["available"]) { quantity }
+                quantities(names: ["available", "committed"]) { name quantity }
               }
             }
           } }
@@ -223,11 +276,14 @@ async function auditVariants() {
     for (const { node } of conn.edges) {
       if (!node.sku || !node.sku.startsWith(SKU_PREFIX) || !node.inventoryItem) continue;
       const lvl = node.inventoryItem.inventoryLevel;
+      const qs = {};
+      for (const q of (lvl && lvl.quantities) || []) qs[q.name] = q.quantity;
       out.push({
         sku: node.sku,
         policy: node.inventoryPolicy,
         tracked: node.inventoryItem.tracked,
-        available: lvl && lvl.quantities && lvl.quantities[0] ? lvl.quantities[0].quantity : null,
+        available: qs.available ?? null,
+        committed: qs.committed ?? 0,
       });
     }
     cursor = conn.pageInfo.hasNextPage ? conn.pageInfo.endCursor : null;
@@ -247,7 +303,10 @@ function runAudit(records, feed) {
     if (r.tracked === false) untracked.push(r.sku);
     if (!inFeed) { notInFeed.push(`${r.sku}(store=${r.available})`); continue; }
     if (fq === 0) soldOut.push(`${r.sku}(store=${r.available}${r.tracked === false ? ",UNTRACKED!" : ""}${r.policy !== "DENY" ? ",CONTINUE!" : ""})`);
-    if (r.available !== fq) mismatch.push(`${r.sku}: store=${r.available} feed=${fq}`);
+    // Expected available = feed − locally committed (units sold here that
+    // Schindler doesn't know about yet), floored at 0.
+    const expected = Math.max(0, fq - r.committed);
+    if (r.available !== expected) mismatch.push(`${r.sku}: store=${r.available} expected=${expected} (feed=${fq} committed=${r.committed})`);
   }
   log("\n================ AUDIT REPORT ================");
   log(`Variants checked: ${records.length}\n`);
@@ -346,7 +405,13 @@ async function setQuantities(quantities) {
     fail("SHOPIFY_STORE_DOMAIN and SHOPIFY_ADMIN_TOKEN are required.");
   }
 
-  const xml = await loadFeed();
+  const state = useState ? readState() : {};
+  const loaded = await loadFeed(state);
+  if (loaded.notModified) {
+    log("Feed not modified (HTTP 304) — nothing to do.");
+    return;
+  }
+  const xml = loaded.xml;
 
   // Full-feed name/code search (any vendor, ignores SKU_PREFIX). No writes.
   if (DEBUG_FIND) {
@@ -383,32 +448,51 @@ async function setQuantities(quantities) {
     fail(`Only ${feedCount} feed items (< MIN_FEED_ITEMS=${MIN_FEED_ITEMS}); aborting without writes.`);
   }
 
+  // Loop-run optimization: if the parsed stock map is byte-identical to the
+  // previous run's, the store is already consistent — Shopify itself maintains
+  // available = feed − committed between feed changes (orders decrement
+  // available as they commit units). Skip all Shopify calls.
+  const feedHash = crypto.createHash("sha1").update(JSON.stringify(feed)).digest("hex");
+  if (useState && !force && state.feedHash === feedHash) {
+    writeState({ ...state }); // keep etag/lastModified fresh
+    log("Feed unchanged since last run — skipping Shopify calls.");
+    return;
+  }
+
   const records = await fetchVariants();
   log(`Store: ${records.length} '${SKU_PREFIX}*' variants.`);
 
+  // Target available = feed quantity MINUS units committed to local unfulfilled
+  // orders. Schindler's feed can't know about our sales until we place the B2B
+  // order, so writing the raw feed value would re-list units our customers
+  // already bought. Floored at 0. Only actual diffs are written.
   const quantities = [];
   const updated = [];
   for (const r of records) {
-    if (Object.prototype.hasOwnProperty.call(feed, r.sku)) {
-      quantities.push({ inventoryItemId: r.inventoryItemId, locationId: SHOPIFY_LOCATION_ID, quantity: feed[r.sku] });
-      updated.push(`${r.sku}=${feed[r.sku]}`);
-    }
+    if (!Object.prototype.hasOwnProperty.call(feed, r.sku)) continue;
+    const target = Math.max(0, feed[r.sku] - r.committed);
+    if (r.available === target) continue;
+    quantities.push({ inventoryItemId: r.inventoryItemId, locationId: SHOPIFY_LOCATION_ID, quantity: target });
+    updated.push(`${r.sku}=${target}${r.committed ? ` (feed=${feed[r.sku]}−committed=${r.committed})` : ""}`);
   }
 
   const skipped = records.map((r) => r.sku).filter((s) => !(s in feed));
-  log(`Matched ${quantities.length} variants. Skipped (in store, not in feed): ${skipped.length}${skipped.length ? " → " + skipped.join(", ") : ""}`);
+  log(`Diffs to write: ${quantities.length}. Skipped (in store, not in feed): ${skipped.length}${skipped.length ? " → " + skipped.join(", ") : ""}`);
 
-  // 1) Sync quantities for feed-matched variants.
+  // 1) Sync quantities for feed-matched variants that differ from target.
   if (!quantities.length) {
     log("Nothing to update (quantities).");
   } else if (dryRun) {
     log("DRY_RUN — would set: " + updated.join(", "));
   } else {
     await setQuantities(quantities);
-    log(`✓ Updated ${quantities.length} variants at ${new Date().toISOString()}.`);
+    log(`✓ Updated: ${updated.join(", ")} at ${new Date().toISOString()}.`);
   }
 
   // 2) Enforce DENY on every managed variant (feed-matched or not) so 0-stock
   //    items actually show as sold out instead of "continue selling".
   await enforceDenyPolicy(records);
+
+  // Only mark this feed content as fully applied after successful writes.
+  if (useState && !dryRun) writeState({ ...state, feedHash });
 })().catch((e) => fail(e && e.stack ? e.stack : String(e)));
