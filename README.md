@@ -1,16 +1,23 @@
 # Bike Care.cz — Inventory sync
 
-Keeps Shopify stock in sync with the **Schindler B2B** XML feed, automatically,
-several times a day. No app fees, no manual edits.
+Keeps Shopify stock in sync with the **Schindler B2B** XML feed, near-real-time
+(~30 s), free. No app fees, no manual edits.
 
 ## How it works
 
 `sync.js` (dependency-free Node) does, on every run:
 
-1. Downloads the Schindler B2B feed (gzip) and decompresses it.
+1. Downloads the Schindler B2B feed (gzip) and decompresses it — with a
+   conditional GET (ETag/Last-Modified) in loop runs, so an unchanged feed
+   costs one 304 and nothing else.
 2. Reads `STOCK_ITEM` per product `CODE`.
 3. Matches feed `CODE` → Shopify variant **SKU** (they're identical, e.g. `DY-029`).
-4. Sets the **available** quantity at the store location via `inventorySetQuantities`.
+4. Sets the **available** quantity at the store location via
+   `inventorySetQuantities` to `max(0, feed − committed)` — locally committed
+   (unfulfilled-order) units are subtracted because Schindler's feed can't know
+   about our sales until the B2B order is placed. Only actual diffs are written;
+   if the parsed feed is identical to the previous loop iteration, all Shopify
+   calls are skipped.
 5. Forces `inventoryPolicy = DENY` on every managed variant, so items synced to
    0 actually show as **sold out** instead of "continue selling when out of
    stock" (which would keep them buyable at 0). Idempotent — a no-op once the
@@ -46,7 +53,8 @@ the script handles that automatically.
 
 ### 3. GitHub repo + secrets
 
-Push this folder to a **private** GitHub repo, then in
+Push this folder to a GitHub repo (public is fine — and gives unlimited free
+Actions minutes; credentials live only in encrypted Actions secrets), then in
 **Settings → Secrets and variables → Actions → New repository secret** add:
 
 | Secret | Value |
@@ -55,31 +63,26 @@ Push this folder to a **private** GitHub repo, then in
 | `SHOPIFY_ADMIN_TOKEN` | the `shpat_…` token from step 1 |
 | `FEED_URL` | the feed URL from step 2 |
 
-Actions are scheduled in `.github/workflows/sync.yml` (hourly at `:17`). Open the
-**Actions** tab → **Inventory sync** → **Run workflow** to trigger it manually;
-tick **Dry run** the first time to preview without writing, **audit** for a
-read-only feed-vs-store health report, or set **debug_sku** (e.g. `DY-156`) to
-print Schindler's raw feed block for a CODE without writing.
+### 4. Scheduling: the self-chaining loop
 
-### 4. Reliable scheduling (external pinger) — recommended
+The repo is **public**, so Actions minutes are unlimited and free. GitHub
+**throttles and drops `schedule:` jobs** (delays of 1–5 h are normal), so the
+cron is NOT the clock — it's only a fallback. The actual cadence comes from a
+**self-perpetuating chain**: each "loop" run syncs every ~30 s for ~55 min,
+then dispatches its own successor via `workflow_dispatch` using the built-in
+`GITHUB_TOKEN` (workflow_dispatch is an explicit exception to GitHub's
+no-recursion rule, so no PAT is needed). The hourly cron restarts the chain if
+it ever dies; the concurrency group stops parallel chains from forming.
 
-GitHub **throttles and drops `schedule:` jobs** — they can be delayed hours or
-skipped, which is what makes stock look stale. The fix is to trigger the workflow
-from an outside clock; GitHub runs *dispatched* jobs immediately, no throttling.
-The `schedule:` above stays as a best-effort fallback.
-
-1. **Fine-grained GitHub token** — github.com → Settings → Developer settings →
-   Personal access tokens → Fine-grained tokens → **Generate new token**.
-   Repository access: *Only select repositories* → `bike-care-inventory-sync`.
-   Permissions → **Actions: Read and write** (Metadata read is added
-   automatically). Copy the `github_pat_…` token.
-2. **cron-job.org** (free) → **Create cronjob**, **Every 1 hour**, Advanced:
-   - URL: `https://api.github.com/repos/Honzeenek/bike-care-inventory-sync/actions/workflows/sync.yml/dispatches`
-   - Method: `POST` · Body: `{"ref":"main"}`
-   - Headers: `Authorization: Bearer github_pat_…` · `Accept: application/vnd.github+json` · `X-GitHub-Api-Version: 2022-11-28`
-
-GitHub returns `204` on success. The token only triggers runs on this one repo —
-it can't read code or secrets. ~1 Actions minute per run (~720/month hourly).
+- **Start the chain:** Actions → Inventory sync → Run workflow → tick
+  **chained** (or `gh workflow run sync.yml -f chained=true`).
+- **Stop everything:** Actions → Inventory sync → ⋯ → **Disable workflow**
+  (dispatches to a disabled workflow are rejected, which ends the chain).
+- **One-off manual run:** Run workflow *without* chained — single pass; tick
+  **Dry run** to preview without writing, **audit** for a read-only
+  feed-vs-store health report, or set **debug_sku** (e.g. `DY-156`) to print
+  Schindler's raw feed block for a CODE (wholesale prices redacted — logs are
+  public).
 
 ## Run locally (testing)
 
