@@ -1,0 +1,28 @@
+name: Tools (read-only)
+
+# One-off read-only reports that must NOT share the inventory-sync concurrency
+# group (a pending run there would displace the self-chaining loop's successor).
+on:
+  workflow_dispatch:
+    inputs:
+      ean_report:
+        description: "Print CODE / EAN / stock for all owned feed items"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Report
+        env:
+          FEED_URL: ${{ secrets.FEED_URL }}
+          SHOPIFY_STORE_DOMAIN: ${{ secrets.SHOPIFY_STORE_DOMAIN }}
+          SHOPIFY_ADMIN_TOKEN: ${{ secrets.SHOPIFY_ADMIN_TOKEN }}
+          EAN_REPORT: ${{ github.event.inputs.ean_report == 'true' && '1' || '' }}
+        run: node sync.js

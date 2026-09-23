@@ -57,6 +57,7 @@ const {
   DRY_RUN = "",
   DEBUG_SKU = "", // comma-separated CODE(s) → print raw feed block(s) and exit-safe
   DEBUG_FIND = "", // substring → search ALL feed items (any CODE) by CODE/PRODUCTNAME, no writes
+  EAN_REPORT = "", // "1" = print CODE<TAB>EAN<TAB>stock for every owned feed item, no writes
   AUDIT = "", // "1" = read-only health report (feed vs live store qty + tracking), no writes
   FEED_STATE_FILE = "",
   FORCE = "",
@@ -425,6 +426,17 @@ async function setQuantities(quantities) {
   }
 
   const { stock: feed, raw: feedRaw } = parseFeed(xml);
+
+  // EAN report: Schindler's feed carries EANs that the store's barcodes lack
+  // (Heureka pairs offers to product cards by EAN). Prints, writes nothing.
+  if (EAN_REPORT) {
+    log("CODE\tEAN\tSTOCK");
+    for (const code of Object.keys(feedRaw).sort()) {
+      const m = feedRaw[code].match(/<EAN>(?:<!\[CDATA\[)?\s*([^<\]]*?)\s*(?:\]\]>)?<\/EAN>/);
+      log(`${code}\t${m ? m[1] : ""}\t${feed[code]}`);
+    }
+    return;
+  }
   const feedCount = Object.keys(feed).length;
   log(`Feed: ${feedCount} '${SKU_PREFIXES.join("|")}*' items.`);
 
