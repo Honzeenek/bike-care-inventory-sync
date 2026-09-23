@@ -4,8 +4,8 @@
  *
  * Pulls the Schindler B2B XML feed (gzip), reads STOCK_ITEM per product CODE,
  * matches CODE → Shopify variant SKU, and sets the "available" quantity at the
- * store's location. Only variants whose SKU starts with SKU_PREFIX (default
- * "DY-") AND that exist in the feed are touched — anything not in the feed
+ * store's location. Only variants whose SKU starts with one of SKU_PREFIX
+ * (default "DY-" = Dynamic, plus KMC chain/link codes) AND that exist in the feed are touched — anything not in the feed
  * (custom bundles, discontinued items) is never modified.
  *
  * It also enforces inventoryPolicy = DENY on every managed SKU_PREFIX variant
@@ -25,7 +25,8 @@
  *   FEED_URL               live gzip feed URL from the B2B portal (contains the ?key=...)
  * Optional env:
  *   SHOPIFY_LOCATION_ID    default gid://shopify/Location/120161861972
- *   SKU_PREFIX             default "DY-"
+ *   SKU_PREFIX             comma-separated prefixes, default "DY-,BX,BE,BS,BY,WC"
+ *                          (DY- = Dynamic; BX/BE/BS/BY = KMC chains, WC = KMC links)
  *   API_VERSION            default "2025-07"
  *   MIN_FEED_ITEMS         safety floor; abort if fewer matching items parsed (default 10)
  *   DRY_RUN                "1" = log what would change, write nothing
@@ -50,7 +51,7 @@ const {
   FEED_URL,
   FEED_FILE,
   SHOPIFY_LOCATION_ID = "gid://shopify/Location/120161861972",
-  SKU_PREFIX = "DY-",
+  SKU_PREFIX = "DY-,BX,BE,BS,BY,WC",
   API_VERSION = "2025-07",
   MIN_FEED_ITEMS = "10",
   DRY_RUN = "",
@@ -60,6 +61,9 @@ const {
   FEED_STATE_FILE = "",
   FORCE = "",
 } = process.env;
+
+const SKU_PREFIXES = SKU_PREFIX.split(",").map((p) => p.trim()).filter(Boolean);
+const owned = (sku) => SKU_PREFIXES.some((p) => sku.startsWith(p));
 
 const dryRun = DRY_RUN === "1" || DRY_RUN === "true";
 const auditMode = AUDIT === "1" || AUDIT === "true";
@@ -134,7 +138,7 @@ function parseFeed(xml) {
     const codeM = it.match(/<CODE>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/CODE>/);
     if (!codeM) continue;
     const code = codeM[1].trim();
-    if (!code.startsWith(SKU_PREFIX)) continue;
+    if (!owned(code)) continue;
     const stockM = it.match(/<STOCK_ITEM>\s*(\d+)\s*<\/STOCK_ITEM>/);
     stock[code] = stockM ? parseInt(stockM[1], 10) : 0; // missing STOCK_ITEM ⇒ out of stock
     // For DEBUG_SKU. Wholesale prices are redacted — Actions logs are public.
@@ -223,7 +227,7 @@ async function fetchVariants() {
     );
     const conn = data.productVariants;
     for (const { node } of conn.edges) {
-      if (node.sku && node.sku.startsWith(SKU_PREFIX) && node.inventoryItem) {
+      if (node.sku && owned(node.sku) && node.inventoryItem) {
         const qs = {};
         const lvl = node.inventoryItem.inventoryLevel;
         for (const q of (lvl && lvl.quantities) || []) qs[q.name] = q.quantity;
@@ -274,7 +278,7 @@ async function auditVariants() {
     );
     const conn = data.productVariants;
     for (const { node } of conn.edges) {
-      if (!node.sku || !node.sku.startsWith(SKU_PREFIX) || !node.inventoryItem) continue;
+      if (!node.sku || !owned(node.sku) || !node.inventoryItem) continue;
       const lvl = node.inventoryItem.inventoryLevel;
       const qs = {};
       for (const q of (lvl && lvl.quantities) || []) qs[q.name] = q.quantity;
@@ -422,7 +426,7 @@ async function setQuantities(quantities) {
 
   const { stock: feed, raw: feedRaw } = parseFeed(xml);
   const feedCount = Object.keys(feed).length;
-  log(`Feed: ${feedCount} '${SKU_PREFIX}*' items.`);
+  log(`Feed: ${feedCount} '${SKU_PREFIXES.join("|")}*' items.`);
 
   // Debug: dump the raw feed block(s) for the given CODE(s) so we can inspect
   // how Schindler represents availability. Prints and exits without writing.
@@ -438,7 +442,7 @@ async function setQuantities(quantities) {
   // Read-only audit: report feed vs live store state and exit without writing.
   if (auditMode) {
     const audited = await auditVariants();
-    log(`Store: ${audited.length} '${SKU_PREFIX}*' variants.`);
+    log(`Store: ${audited.length} '${SKU_PREFIXES.join("|")}*' variants.`);
     runAudit(audited, feed);
     return;
   }
@@ -460,7 +464,7 @@ async function setQuantities(quantities) {
   }
 
   const records = await fetchVariants();
-  log(`Store: ${records.length} '${SKU_PREFIX}*' variants.`);
+  log(`Store: ${records.length} '${SKU_PREFIXES.join("|")}*' variants.`);
 
   // Target available = feed quantity MINUS units committed to local unfulfilled
   // orders. Schindler's feed can't know about our sales until we place the B2B

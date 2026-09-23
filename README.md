@@ -109,7 +109,7 @@ SHOPIFY_STORE_DOMAIN=... SHOPIFY_ADMIN_TOKEN=... node sync.js
 | `SHOPIFY_ADMIN_TOKEN` | — | Admin API token |
 | `FEED_URL` | — | live gzip feed URL |
 | `SHOPIFY_LOCATION_ID` | `gid://shopify/Location/120161861972` | "Shop location" |
-| `SKU_PREFIX` | `DY-` | which SKUs this sync owns |
+| `SKU_PREFIX` | `DY-,BX,BE,BS,BY,WC` | comma-separated SKU prefixes this sync owns (Dynamic + KMC) |
 | `API_VERSION` | `2025-07` | Admin API version |
 | `MIN_FEED_ITEMS` | `10` | safety floor |
 | `DRY_RUN` | — | `1` = log only |
