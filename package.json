@@ -4,7 +4,7 @@
   "private": true,
   "description": "Schindler B2B XML feed → Shopify inventory sync for Bike Care.cz",
   "type": "commonjs",
-  "engines": { "node": ">=20" },
+  "engines": { "node": ">=22.23.4" },
   "scripts": {
     "sync": "node sync.js",
     "dry-run": "DRY_RUN=1 node sync.js"
